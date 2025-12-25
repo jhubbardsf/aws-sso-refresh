@@ -66,6 +66,10 @@
       color: var(--accent);
     }
 
+    h1 .nowrap {
+      white-space: nowrap;
+    }
+
     .tagline {
       font-size: 1.25rem;
       color: var(--text-muted);
@@ -83,14 +87,16 @@
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      max-width: 520px;
+      max-width: 600px;
       margin: 0 auto;
     }
 
     .install-box code {
       font-family: 'JetBrains Mono', monospace;
-      font-size: 14px;
+      font-size: 13px;
       color: var(--text);
+      white-space: nowrap;
+      overflow-x: auto;
     }
 
     .install-box .prefix {
@@ -346,7 +352,7 @@
     <!-- Hero -->
     <section class="hero">
       <div class="badge">macOS + AWS SSO</div>
-      <h1>Never hit <code>"token expired"</code> again</h1>
+      <h1>Never hit <span class="nowrap"><code>"token expired"</code> again</span></h1>
       <p class="tagline">
         A tiny daemon that automatically refreshes your AWS SSO sessions before they expire.
       </p>
