@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>aws-sso-refresh - Never hit "token expired" again</title>
+  <meta name="description" content="Automatically refresh AWS SSO sessions before they expire. A simple daemon that keeps your tokens fresh.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --surface: #141414;
+      --border: #262626;
+      --text: #fafafa;
+      --text-muted: #a1a1a1;
+      --accent: #f97316;
+      --accent-dim: #ea580c;
+      --green: #22c55e;
+      --yellow: #eab308;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Hero */
+    .hero {
+      padding: 80px 0 60px;
+      text-align: center;
+    }
+
+    .badge {
+      display: inline-block;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 6px 14px;
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 5vw, 3rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+    }
+
+    h1 code {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent);
+    }
+
+    .tagline {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 500px;
+      margin: 0 auto 40px;
+    }
+
+    /* Install box */
+    .install-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      max-width: 520px;
+      margin: 0 auto;
+    }
+
+    .install-box code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+      color: var(--text);
+    }
+
+    .install-box .prefix {
+      color: var(--text-muted);
+      user-select: none;
+    }
+
+    .copy-btn {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+
+    .copy-btn:hover {
+      background: var(--accent-dim);
+    }
+
+    .copy-btn.copied {
+      background: var(--green);
+    }
+
+    /* Problem section */
+    .problem {
+      padding: 60px 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .problem-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+    }
+
+    @media (max-width: 600px) {
+      .problem-grid { grid-template-columns: 1fr; }
+    }
+
+    .problem-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+
+    .problem-card.before { border-color: #dc2626; }
+    .problem-card.after { border-color: var(--green); }
+
+    .problem-card h3 {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 16px;
+    }
+
+    .problem-card.before h3 { color: #ef4444; }
+    .problem-card.after h3 { color: var(--green); }
+
+    .problem-card p {
+      color: var(--text-muted);
+      font-size: 15px;
+    }
+
+    /* Terminal */
+    .terminal-section {
+      padding: 60px 0;
+    }
+
+    .terminal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .terminal-header {
+      background: #1a1a1a;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .terminal-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .terminal-dot.red { background: #ff5f57; }
+    .terminal-dot.yellow { background: #febc2e; }
+    .terminal-dot.green { background: #28c840; }
+
+    .terminal-body {
+      padding: 20px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .terminal-line {
+      display: flex;
+      gap: 8px;
+    }
+
+    .terminal-prompt {
+      color: var(--accent);
+      user-select: none;
+    }
+
+    .terminal-output {
+      color: var(--text-muted);
+      padding-left: 20px;
+    }
+
+    .terminal-output.status {
+      color: var(--text);
+    }
+
+    .terminal-output .check {
+      color: var(--green);
+    }
+
+    .terminal-output .time {
+      color: var(--yellow);
+    }
+
+    .terminal-output .label {
+      color: var(--text-muted);
+    }
+
+    /* Features */
+    .features {
+      padding: 60px 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .features h2 {
+      text-align: center;
+      font-size: 1.5rem;
+      margin-bottom: 40px;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+    }
+
+    @media (max-width: 600px) {
+      .feature-grid { grid-template-columns: 1fr; }
+    }
+
+    .feature {
+      text-align: center;
+      padding: 24px;
+    }
+
+    .feature-icon {
+      font-size: 2rem;
+      margin-bottom: 12px;
+    }
+
+    .feature h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .feature p {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* CTA */
+    .cta {
+      padding: 60px 0;
+      text-align: center;
+      border-top: 1px solid var(--border);
+    }
+
+    .cta h2 {
+      font-size: 1.5rem;
+      margin-bottom: 24px;
+    }
+
+    .cta-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 24px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 500;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-dim);
+    }
+
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--text-muted);
+    }
+
+    /* Footer */
+    footer {
+      padding: 40px 0;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    footer a {
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Hero -->
+    <section class="hero">
+      <div class="badge">macOS + AWS SSO</div>
+      <h1>Never hit <code>"token expired"</code> again</h1>
+      <p class="tagline">
+        A tiny daemon that automatically refreshes your AWS SSO sessions before they expire.
+      </p>
+      <div class="install-box">
+        <code><span class="prefix">$ </span>brew install jhubbardsf/aws-sso-refresh/aws-sso-refresh</code>
+        <button class="copy-btn" onclick="copyInstall(this)">Copy</button>
+      </div>
+    </section>
+
+    <!-- Problem/Solution -->
+    <section class="problem">
+      <div class="problem-grid">
+        <div class="problem-card before">
+          <h3>Before</h3>
+          <p>Your AWS SSO tokens expire every few hours. You're deep in work, run a command, and... <em>"The SSO session has expired"</em>. Context switch. Browser. Click. Wait. Back to work.</p>
+        </div>
+        <div class="problem-card after">
+          <h3>After</h3>
+          <p>Install the daemon once. It checks every 10 minutes and refreshes sessions before they expire. Your tokens stay fresh. You stay focused.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Terminal Demo -->
+    <section class="terminal-section">
+      <div class="terminal">
+        <div class="terminal-header">
+          <div class="terminal-dot red"></div>
+          <div class="terminal-dot yellow"></div>
+          <div class="terminal-dot green"></div>
+        </div>
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="terminal-prompt">$</span>
+            <span>aws-sso-refresh status</span>
+          </div>
+          <div class="terminal-output status">
+            <br>
+            AWS SSO Sessions:<br><br>
+            <span class="check">&nbsp;&nbsp;&#10003;</span> my-company-sso&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="time">5h 23m remaining</span><br>
+            <span class="check">&nbsp;&nbsp;&#10003;</span> my-personal-sso&nbsp;&nbsp;&nbsp;&nbsp;<span class="time">2h 10m remaining</span><br>
+            <br>
+            <span class="label">Daemon:</span> running (PID 1234)<br>
+            <span class="label">Interval:</span> every 10 minutes<br>
+            <span class="label">Threshold:</span> refresh when &lt; 30m remaining
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features">
+      <h2>Simple by design</h2>
+      <div class="feature-grid">
+        <div class="feature">
+          <div class="feature-icon">&#9881;</div>
+          <h3>Zero config</h3>
+          <p>Reads your existing ~/.aws/config. If you have SSO sessions, it just works.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">&#128268;</div>
+          <h3>Runs quietly</h3>
+          <p>Uses macOS launchd to check every 10 minutes. Opens browser only when needed.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">&#128230;</div>
+          <h3>One command</h3>
+          <p>Install with Homebrew. Run <code>aws-sso-refresh install</code>. Done.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta">
+      <h2>Get started in 30 seconds</h2>
+      <div class="cta-buttons">
+        <a href="https://github.com/jhubbardsf/aws-sso-refresh" class="btn btn-primary">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          View on GitHub
+        </a>
+        <a href="https://github.com/jhubbardsf/aws-sso-refresh#usage" class="btn btn-secondary">
+          Read the docs
+        </a>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <div class="container">
+      Made by <a href="https://github.com/jhubbardsf">@jhubbardsf</a> &middot; MIT License
+    </div>
+  </footer>
+
+  <script>
+    function copyInstall(btn) {
+      const cmd = 'brew install jhubbardsf/aws-sso-refresh/aws-sso-refresh';
+      navigator.clipboard.writeText(cmd).then(() => {
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>
