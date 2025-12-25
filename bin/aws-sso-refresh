@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+#
+# aws-sso-refresh - Automatic AWS SSO session refresh daemon
+#
+# Proactively refreshes AWS SSO sessions before they expire,
+# so you never hit "token expired" errors.
+#
+# Usage:
+#   aws-sso-refresh           Run refresh check (default)
+#   aws-sso-refresh status    Show all sessions with expiry times
+#   aws-sso-refresh install   Install and start the background daemon
+#   aws-sso-refresh uninstall Remove the background daemon
+#   aws-sso-refresh logs      Tail the refresh log
+#   aws-sso-refresh help      Show this help message
+#
+
+set -eo pipefail
+
+# Version
+VERSION="1.0.0"
+
+# Configuration
+REFRESH_THRESHOLD_MINUTES="${AWS_SSO_REFRESH_THRESHOLD:-30}"
+SSO_CACHE_DIR="$HOME/.aws/sso/cache"
+AWS_CONFIG="$HOME/.aws/config"
+LOG_DIR="$HOME/.local/share/aws-sso-refresh"
+LOG_FILE="$LOG_DIR/refresh.log"
+PLIST_NAME="com.aws.sso-refresh"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
+
+# Colors (if terminal supports it)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    BOLD=''
+    NC=''
+fi
+
+# Ensure we have bash 4+ for associative arrays
+if ((BASH_VERSINFO[0] < 4)); then
+    echo "Error: This script requires bash 4.0 or later."
+    echo "Your version: $BASH_VERSION"
+    echo ""
+    echo "On macOS, install modern bash with: brew install bash"
+    exit 1
+fi
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Build a map of startUrl -> sso-session name from ~/.aws/config
+declare -A URL_TO_SESSION
+
+build_session_map() {
+    local current_session=""
+    local current_url=""
+
+    [[ -f "$AWS_CONFIG" ]] || return
+
+    while IFS= read -r line; do
+        # Match [sso-session name]
+        if [[ "$line" =~ ^\[sso-session[[:space:]]+([^\]]+)\] ]]; then
+            # Save previous session if we have both pieces
+            if [[ -n "$current_session" && -n "$current_url" ]]; then
+                URL_TO_SESSION["$current_url"]="$current_session"
+            fi
+            current_session="${BASH_REMATCH[1]}"
+            current_url=""
+        # Match sso_start_url = value
+        elif [[ "$line" =~ ^sso_start_url[[:space:]]*=[[:space:]]*(.+) ]]; then
+            current_url="${BASH_REMATCH[1]}"
+            # Trim whitespace
+            current_url="${current_url%"${current_url##*[![:space:]]}"}"
+        fi
+    done < "$AWS_CONFIG"
+
+    # Don't forget the last one
+    if [[ -n "$current_session" && -n "$current_url" ]]; then
+        URL_TO_SESSION["$current_url"]="$current_session"
+    fi
+}
+
+# Safely get session name from URL (handles missing keys)
+get_session_name() {
+    local url="$1"
+    if [[ -v URL_TO_SESSION["$url"] ]]; then
+        echo "${URL_TO_SESSION[$url]}"
+    fi
+}
+
+# Convert ISO 8601 timestamp to epoch seconds (macOS compatible)
+iso_to_epoch() {
+    local iso_time="$1"
+    # Remove the 'Z' suffix and convert
+    local clean_time="${iso_time%Z}"
+
+    # Try GNU date first, then BSD date
+    if date --version &>/dev/null; then
+        # GNU date
+        date -d "$clean_time" "+%s" 2>/dev/null || echo "0"
+    else
+        # BSD date (macOS)
+        date -j -f "%Y-%m-%dT%H:%M:%S" "$clean_time" "+%s" 2>/dev/null || echo "0"
+    fi
+}
+
+# Format minutes into human-readable time
+format_time() {
+    local minutes=$1
+    if [[ $minutes -lt 0 ]]; then
+        echo "expired"
+    elif [[ $minutes -lt 60 ]]; then
+        echo "${minutes}m"
+    else
+        local hours=$((minutes / 60))
+        local mins=$((minutes % 60))
+        if [[ $mins -eq 0 ]]; then
+            echo "${hours}h"
+        else
+            echo "${hours}h ${mins}m"
+        fi
+    fi
+}
+
+# Get session expiry info
+get_session_info() {
+    local session_name="$1"
+    local start_url=""
+
+    # Find the start_url for this session
+    for url in "${!URL_TO_SESSION[@]}"; do
+        if [[ "${URL_TO_SESSION[$url]}" == "$session_name" ]]; then
+            start_url="$url"
+            break
+        fi
+    done
+
+    [[ -n "$start_url" ]] || return 1
+
+    # Find the cache file for this URL
+    for cache_file in "$SSO_CACHE_DIR"/*.json; do
+        [[ -f "$cache_file" ]] || continue
+
+        local file_url expires_at
+        file_url=$(jq -r '.startUrl // empty' "$cache_file" 2>/dev/null) || continue
+
+        if [[ "$file_url" == "$start_url" ]]; then
+            expires_at=$(jq -r '.expiresAt // empty' "$cache_file" 2>/dev/null) || continue
+            [[ -n "$expires_at" ]] || continue
+
+            local expires_epoch current_epoch minutes_until_expiry
+            expires_epoch=$(iso_to_epoch "$expires_at")
+            current_epoch=$(date "+%s")
+            minutes_until_expiry=$(( (expires_epoch - current_epoch) / 60 ))
+
+            echo "$minutes_until_expiry"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Check and refresh a single session
+check_and_refresh_session() {
+    local cache_file="$1"
+    local session_name="$2"
+
+    # Parse the cache file
+    local expires_at
+    expires_at=$(jq -r '.expiresAt // empty' "$cache_file" 2>/dev/null) || return 0
+
+    # Skip if missing expiration
+    [[ -n "$expires_at" ]] || return 0
+
+    # Calculate time until expiration
+    local expires_epoch current_epoch seconds_until_expiry minutes_until_expiry
+    expires_epoch=$(iso_to_epoch "$expires_at")
+    current_epoch=$(date "+%s")
+    seconds_until_expiry=$((expires_epoch - current_epoch))
+    minutes_until_expiry=$((seconds_until_expiry / 60))
+
+    # Check if we need to refresh
+    if [[ $minutes_until_expiry -le $REFRESH_THRESHOLD_MINUTES ]]; then
+        if [[ $minutes_until_expiry -le 0 ]]; then
+            log "Session '$session_name' has EXPIRED. Refreshing..."
+        else
+            log "Session '$session_name' expires in ${minutes_until_expiry}m (threshold: ${REFRESH_THRESHOLD_MINUTES}m). Refreshing..."
+        fi
+
+        # Perform the refresh
+        if aws sso login --sso-session "$session_name" 2>&1 | tee -a "$LOG_FILE"; then
+            log "Successfully refreshed session '$session_name'"
+        else
+            log "ERROR: Failed to refresh session '$session_name'"
+        fi
+    else
+        log "Session '$session_name' OK - expires in ${minutes_until_expiry}m"
+    fi
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+cmd_refresh() {
+    log "=== AWS SSO Refresh Check Starting ==="
+
+    # Build the URL -> session name mapping
+    build_session_map
+
+    if [[ ${#URL_TO_SESSION[@]} -eq 0 ]]; then
+        log "WARNING: No SSO sessions found in $AWS_CONFIG"
+        exit 0
+    fi
+
+    log "Found ${#URL_TO_SESSION[@]} SSO session(s) to monitor"
+
+    # Track which sessions we've already checked (by session name)
+    declare -A checked_sessions
+
+    # Check each cache file
+    for cache_file in "$SSO_CACHE_DIR"/*.json; do
+        [[ -f "$cache_file" ]] || continue
+
+        # Get session name for this cache file
+        local start_url session_name
+        start_url=$(jq -r '.startUrl // empty' "$cache_file" 2>/dev/null) || continue
+        [[ -n "$start_url" ]] || continue
+
+        session_name=$(get_session_name "$start_url")
+        [[ -n "$session_name" ]] || continue
+
+        # Skip if we've already checked this session
+        if [[ -v checked_sessions["$session_name"] ]]; then
+            continue
+        fi
+
+        check_and_refresh_session "$cache_file" "$session_name"
+
+        # Mark session as checked
+        checked_sessions["$session_name"]=1
+    done
+
+    log "=== AWS SSO Refresh Check Complete ==="
+}
+
+cmd_status() {
+    build_session_map
+
+    if [[ ${#URL_TO_SESSION[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No SSO sessions found in $AWS_CONFIG${NC}"
+        exit 0
+    fi
+
+    echo -e "${BOLD}AWS SSO Sessions:${NC}"
+    echo ""
+
+    # Get unique session names
+    declare -A seen_sessions
+    for session_name in "${URL_TO_SESSION[@]}"; do
+        [[ -v seen_sessions["$session_name"] ]] && continue
+        seen_sessions["$session_name"]=1
+
+        local minutes
+        if minutes=$(get_session_info "$session_name"); then
+            local time_str
+            time_str=$(format_time "$minutes")
+
+            if [[ $minutes -le 0 ]]; then
+                echo -e "  ${RED}✗${NC} $session_name  ${RED}$time_str${NC}"
+            elif [[ $minutes -le $REFRESH_THRESHOLD_MINUTES ]]; then
+                echo -e "  ${YELLOW}!${NC} $session_name  ${YELLOW}$time_str remaining${NC} (will refresh soon)"
+            else
+                echo -e "  ${GREEN}✓${NC} $session_name  ${GREEN}$time_str remaining${NC}"
+            fi
+        else
+            echo -e "  ${RED}✗${NC} $session_name  ${RED}no active session${NC}"
+        fi
+    done
+
+    echo ""
+
+    # Daemon status (capture output first to avoid SIGPIPE with pipefail)
+    local launchctl_output
+    launchctl_output=$(launchctl list 2>/dev/null || true)
+    if echo "$launchctl_output" | grep -q "$PLIST_NAME"; then
+        local pid
+        pid=$(echo "$launchctl_output" | grep "$PLIST_NAME" | awk '{print $1}')
+        if [[ "$pid" != "-" && -n "$pid" ]]; then
+            echo -e "${BOLD}Daemon:${NC} ${GREEN}running${NC} (PID $pid)"
+        else
+            echo -e "${BOLD}Daemon:${NC} ${GREEN}loaded${NC} (waiting for next interval)"
+        fi
+        echo -e "${BOLD}Interval:${NC} every 10 minutes"
+        echo -e "${BOLD}Threshold:${NC} refresh when < ${REFRESH_THRESHOLD_MINUTES}m remaining"
+    else
+        echo -e "${BOLD}Daemon:${NC} ${YELLOW}not installed${NC}"
+        echo -e "  Run '${BLUE}aws-sso-refresh install${NC}' to enable automatic refresh"
+    fi
+}
+
+cmd_install() {
+    echo -e "${BOLD}Installing aws-sso-refresh daemon...${NC}"
+    echo ""
+
+    # Find the script location
+    local script_path
+    script_path=$(command -v aws-sso-refresh 2>/dev/null || echo "$0")
+    script_path=$(realpath "$script_path" 2>/dev/null || echo "$script_path")
+
+    # Determine bash path
+    local bash_path
+    if [[ -x "/opt/homebrew/bin/bash" ]]; then
+        bash_path="/opt/homebrew/bin/bash"
+    elif [[ -x "/usr/local/bin/bash" ]]; then
+        bash_path="/usr/local/bin/bash"
+    else
+        echo -e "${RED}Error: Modern bash (4.0+) not found.${NC}"
+        echo "Install with: brew install bash"
+        exit 1
+    fi
+
+    # Create plist
+    cat > "$PLIST_PATH" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_NAME}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bash_path}</string>
+        <string>${script_path}</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/stderr.log</string>
+</dict>
+</plist>
+EOF
+
+    echo -e "  ${GREEN}✓${NC} Created $PLIST_PATH"
+
+    # Load the agent
+    launchctl load "$PLIST_PATH" 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} Loaded LaunchAgent"
+
+    echo ""
+    echo -e "${GREEN}Daemon installed successfully!${NC}"
+    echo ""
+    echo "The daemon will:"
+    echo "  • Run every 10 minutes"
+    echo "  • Refresh sessions expiring within ${REFRESH_THRESHOLD_MINUTES} minutes"
+    echo "  • Log to $LOG_FILE"
+    echo ""
+    echo -e "View status with: ${BLUE}aws-sso-refresh status${NC}"
+    echo -e "View logs with:   ${BLUE}aws-sso-refresh logs${NC}"
+}
+
+cmd_uninstall() {
+    echo -e "${BOLD}Uninstalling aws-sso-refresh daemon...${NC}"
+    echo ""
+
+    if [[ -f "$PLIST_PATH" ]]; then
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        echo -e "  ${GREEN}✓${NC} Unloaded LaunchAgent"
+
+        rm -f "$PLIST_PATH"
+        echo -e "  ${GREEN}✓${NC} Removed $PLIST_PATH"
+    else
+        echo -e "  ${YELLOW}!${NC} LaunchAgent not found (already uninstalled?)"
+    fi
+
+    echo ""
+    echo -e "${GREEN}Daemon uninstalled.${NC}"
+    echo ""
+    echo "Note: Log files preserved at $LOG_DIR"
+    echo "      Remove manually if desired: rm -rf $LOG_DIR"
+}
+
+cmd_logs() {
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "No log file found at $LOG_FILE"
+        echo "The daemon may not have run yet."
+        exit 1
+    fi
+
+    echo -e "${BOLD}Following $LOG_FILE${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
+    echo ""
+    tail -f "$LOG_FILE"
+}
+
+cmd_help() {
+    cat << EOF
+${BOLD}aws-sso-refresh${NC} v${VERSION}
+
+Automatically refresh AWS SSO sessions before they expire.
+
+${BOLD}USAGE:${NC}
+    aws-sso-refresh [COMMAND]
+
+${BOLD}COMMANDS:${NC}
+    (none)      Run refresh check now
+    status      Show all sessions with expiry times
+    install     Install and start the background daemon
+    uninstall   Remove the background daemon
+    logs        Follow the refresh log
+    help        Show this help message
+    version     Show version
+
+${BOLD}CONFIGURATION:${NC}
+    Set AWS_SSO_REFRESH_THRESHOLD to change the refresh threshold
+    (default: 30 minutes before expiry)
+
+    Example: export AWS_SSO_REFRESH_THRESHOLD=60
+
+${BOLD}EXAMPLES:${NC}
+    aws-sso-refresh              # Check and refresh expiring sessions
+    aws-sso-refresh status       # See all session statuses
+    aws-sso-refresh install      # Enable automatic background refresh
+    aws-sso-refresh logs         # Watch the refresh log
+
+${BOLD}FILES:${NC}
+    ~/.aws/config                AWS config with SSO sessions
+    ~/.aws/sso/cache/            SSO token cache
+    $LOG_FILE    Refresh log
+    $PLIST_PATH  LaunchAgent (macOS)
+
+EOF
+}
+
+cmd_version() {
+    echo "aws-sso-refresh v${VERSION}"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local command="${1:-refresh}"
+
+    case "$command" in
+        status)
+            cmd_status
+            ;;
+        install)
+            cmd_install
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        logs)
+            cmd_logs
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        refresh|"")
+            cmd_refresh
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $command${NC}"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
