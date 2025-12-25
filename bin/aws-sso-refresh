@@ -17,7 +17,7 @@
 set -eo pipefail
 
 # Version
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # Configuration
 REFRESH_THRESHOLD_MINUTES="${AWS_SSO_REFRESH_THRESHOLD:-30}"
@@ -422,42 +422,40 @@ cmd_logs() {
 }
 
 cmd_help() {
-    cat << EOF
-${BOLD}aws-sso-refresh${NC} v${VERSION}
-
-Automatically refresh AWS SSO sessions before they expire.
-
-${BOLD}USAGE:${NC}
-    aws-sso-refresh [COMMAND]
-
-${BOLD}COMMANDS:${NC}
-    (none)      Run refresh check now
-    status      Show all sessions with expiry times
-    install     Install and start the background daemon
-    uninstall   Remove the background daemon
-    logs        Follow the refresh log
-    help        Show this help message
-    version     Show version
-
-${BOLD}CONFIGURATION:${NC}
-    Set AWS_SSO_REFRESH_THRESHOLD to change the refresh threshold
-    (default: 30 minutes before expiry)
-
-    Example: export AWS_SSO_REFRESH_THRESHOLD=60
-
-${BOLD}EXAMPLES:${NC}
-    aws-sso-refresh              # Check and refresh expiring sessions
-    aws-sso-refresh status       # See all session statuses
-    aws-sso-refresh install      # Enable automatic background refresh
-    aws-sso-refresh logs         # Watch the refresh log
-
-${BOLD}FILES:${NC}
-    ~/.aws/config                AWS config with SSO sessions
-    ~/.aws/sso/cache/            SSO token cache
-    $LOG_FILE    Refresh log
-    $PLIST_PATH  LaunchAgent (macOS)
-
-EOF
+    echo -e "${BOLD}aws-sso-refresh${NC} v${VERSION}"
+    echo ""
+    echo "Automatically refresh AWS SSO sessions before they expire."
+    echo ""
+    echo -e "${BOLD}USAGE:${NC}"
+    echo "    aws-sso-refresh [COMMAND]"
+    echo ""
+    echo -e "${BOLD}COMMANDS:${NC}"
+    echo "    (none)      Run refresh check now"
+    echo "    status      Show all sessions with expiry times"
+    echo "    install     Install and start the background daemon"
+    echo "    uninstall   Remove the background daemon"
+    echo "    logs        Follow the refresh log"
+    echo "    help        Show this help message"
+    echo "    version     Show version"
+    echo ""
+    echo -e "${BOLD}CONFIGURATION:${NC}"
+    echo "    Set AWS_SSO_REFRESH_THRESHOLD to change the refresh threshold"
+    echo "    (default: 30 minutes before expiry)"
+    echo ""
+    echo "    Example: export AWS_SSO_REFRESH_THRESHOLD=60"
+    echo ""
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo "    aws-sso-refresh              # Check and refresh expiring sessions"
+    echo "    aws-sso-refresh status       # See all session statuses"
+    echo "    aws-sso-refresh install      # Enable automatic background refresh"
+    echo "    aws-sso-refresh logs         # Watch the refresh log"
+    echo ""
+    echo -e "${BOLD}FILES:${NC}"
+    echo "    ~/.aws/config                AWS config with SSO sessions"
+    echo "    ~/.aws/sso/cache/            SSO token cache"
+    echo "    $LOG_FILE    Refresh log"
+    echo "    $PLIST_PATH  LaunchAgent (macOS)"
+    echo ""
 }
 
 cmd_version() {
