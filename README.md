@@ -8,7 +8,7 @@ When using AWS SSO (Identity Center), your session tokens expire after a few hou
 
 ## The Solution
 
-`aws-sso-refresh` runs as a background daemon and proactively refreshes your SSO sessions before they expire. It opens a browser window for re-authentication (which auto-approves if you're already logged in), so your tokens stay fresh.
+`aws-sso-refresh` runs as a background daemon and proactively refreshes your SSO sessions before they expire. It uses the AWS SSO OIDC API to **silently refresh tokens** without opening a browser. Only when the underlying session has truly expired does it fall back to browser-based re-authentication.
 
 ## Installation
 
@@ -57,8 +57,8 @@ aws-sso-refresh help
 
 1. **Parses** your `~/.aws/config` to find all `[sso-session]` blocks
 2. **Checks** the token cache at `~/.aws/sso/cache/` for expiration times
-3. **Refreshes** sessions within 30 minutes of expiring via `aws sso login --sso-session <name>`
-4. **Opens a browser** for re-authentication (auto-approves if already logged in)
+3. **Silently refreshes** sessions using the SSO OIDC API with the stored refresh token (no browser needed!)
+4. **Falls back to browser** only when the refresh token itself has expired (rare - typically after the Identity Center session duration ends)
 
 ### Example Status Output
 
@@ -89,6 +89,14 @@ By default, the daemon checks sessions every 10 minutes. Customize this with:
 
 ```bash
 export AWS_SSO_REFRESH_INTERVAL=5  # Check every 5 minutes (min: 1, max: 60)
+```
+
+### Session Duration
+
+For accurate "browser re-auth" estimates in status output, set this to match your Identity Center session duration:
+
+```bash
+export AWS_SSO_SESSION_DURATION=8  # Default: 8 hours (check with your AWS admin)
 ```
 
 **Note:** After changing these values, run `aws-sso-refresh uninstall` and `aws-sso-refresh install` to update the daemon configuration.
@@ -145,9 +153,17 @@ brew install bash
 2. Check the logs: `aws-sso-refresh logs`
 3. Run manually to test: `aws-sso-refresh`
 
-### Browser doesn't auto-approve
+### Browser keeps opening
 
-Your Identity Center session may have expired. You'll need to manually approve in the browser once, then subsequent refreshes should be automatic.
+If the browser opens frequently for re-authentication, it means the underlying Identity Center session has expired and the refresh token can no longer silently refresh. This typically happens when:
+
+- The session duration in AWS Identity Center is set to a short period (e.g., 1 hour)
+- You've been away from your computer for longer than the session duration
+- The Identity Center administrator has revoked your session
+
+After re-authenticating in the browser once, subsequent refreshes should be silent again until the session duration expires.
+
+**Note:** The session duration is configured by your AWS administrator in Identity Center settings (typically 8-12 hours by default, up to 7 days).
 
 ## License
 

@@ -19,15 +19,17 @@
 set -eo pipefail
 
 # Version
-VERSION="1.0.3"
+VERSION="1.1.0"
 
 # Configuration
 REFRESH_THRESHOLD_MINUTES="${AWS_SSO_REFRESH_THRESHOLD:-30}"
 REFRESH_INTERVAL_MINUTES="${AWS_SSO_REFRESH_INTERVAL:-10}"
+SESSION_DURATION_HOURS="${AWS_SSO_SESSION_DURATION:-8}"  # Identity Center session duration (default: 8 hours)
 SSO_CACHE_DIR="$HOME/.aws/sso/cache"
 AWS_CONFIG="$HOME/.aws/config"
 LOG_DIR="$HOME/.local/share/aws-sso-refresh"
 LOG_FILE="$LOG_DIR/refresh.log"
+SESSIONS_FILE="$LOG_DIR/sessions.json"  # Tracks browser login times
 PLIST_NAME="com.aws.sso-refresh"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 
@@ -188,6 +190,159 @@ get_session_info() {
     return 1
 }
 
+# Calculate future epoch timestamp (macOS compatible)
+# Args: seconds_from_now
+epoch_plus_seconds() {
+    local seconds="$1"
+    local current_epoch
+    current_epoch=$(date "+%s")
+    echo $((current_epoch + seconds))
+}
+
+# Convert epoch to ISO 8601 timestamp
+epoch_to_iso() {
+    local epoch="$1"
+    # Try GNU date first, then BSD date
+    if date --version &>/dev/null; then
+        date -u -d "@$epoch" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null
+    else
+        date -u -r "$epoch" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null
+    fi
+}
+
+# Record when a browser login happened for a session
+record_browser_login() {
+    local session_name="$1"
+    local login_time
+    login_time=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+
+    # Create sessions file if it doesn't exist
+    if [[ ! -f "$SESSIONS_FILE" ]]; then
+        echo "{}" > "$SESSIONS_FILE"
+    fi
+
+    # Update the session's last browser login time
+    local tmp_file="${SESSIONS_FILE}.tmp.$$"
+    if jq --arg session "$session_name" \
+          --arg time "$login_time" \
+          '.[$session] = {lastBrowserLogin: $time}' \
+          "$SESSIONS_FILE" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$SESSIONS_FILE"; then
+        return 0
+    else
+        rm -f "$tmp_file"
+        return 1
+    fi
+}
+
+# Get the last browser login time for a session
+get_last_browser_login() {
+    local session_name="$1"
+    [[ -f "$SESSIONS_FILE" ]] || return 1
+    jq -r --arg session "$session_name" '.[$session].lastBrowserLogin // empty' "$SESSIONS_FILE" 2>/dev/null
+}
+
+# Calculate minutes until browser re-auth will be needed
+# Returns: minutes until session expires, or -1 if unknown
+get_session_expiry_minutes() {
+    local session_name="$1"
+    local last_login
+
+    last_login=$(get_last_browser_login "$session_name")
+    [[ -n "$last_login" ]] || return 1
+
+    local login_epoch current_epoch session_duration_seconds session_expiry_epoch
+    login_epoch=$(iso_to_epoch "$last_login")
+    current_epoch=$(date "+%s")
+    session_duration_seconds=$((SESSION_DURATION_HOURS * 3600))
+    session_expiry_epoch=$((login_epoch + session_duration_seconds))
+
+    local seconds_until_expiry=$((session_expiry_epoch - current_epoch))
+    echo $((seconds_until_expiry / 60))
+}
+
+# Attempt silent token refresh using the SSO OIDC refresh_token
+# Returns 0 on success, 1 on failure (requires browser login)
+silent_refresh_session() {
+    local cache_file="$1"
+    local session_name="$2"
+
+    # Extract required fields from cache file
+    local client_id client_secret refresh_token region
+    client_id=$(jq -r '.clientId // empty' "$cache_file" 2>/dev/null)
+    client_secret=$(jq -r '.clientSecret // empty' "$cache_file" 2>/dev/null)
+    refresh_token=$(jq -r '.refreshToken // empty' "$cache_file" 2>/dev/null)
+    region=$(jq -r '.region // "us-east-1"' "$cache_file" 2>/dev/null)
+
+    # Verify we have all required fields
+    if [[ -z "$client_id" || -z "$client_secret" || -z "$refresh_token" ]]; then
+        log "Silent refresh unavailable for '$session_name': missing required tokens"
+        return 1
+    fi
+
+    # Call AWS SSO OIDC API to refresh the token
+    local response
+    if response=$(aws sso-oidc create-token \
+        --client-id "$client_id" \
+        --client-secret "$client_secret" \
+        --grant-type "refresh_token" \
+        --refresh-token "$refresh_token" \
+        --region "$region" \
+        --output json 2>&1); then
+
+        # Parse the new tokens from response
+        local new_access_token new_refresh_token new_expires_in
+        new_access_token=$(echo "$response" | jq -r '.accessToken // empty')
+        new_refresh_token=$(echo "$response" | jq -r '.refreshToken // empty')
+        new_expires_in=$(echo "$response" | jq -r '.expiresIn // empty')
+
+        # Validate response
+        if [[ -z "$new_access_token" || -z "$new_expires_in" ]]; then
+            log "Silent refresh failed for '$session_name': invalid API response"
+            return 1
+        fi
+
+        # Check if the new token has meaningful validity (at least 5 minutes)
+        # If it's too short, the underlying session is near expiry and needs browser re-auth
+        local min_valid_seconds=300  # 5 minutes
+        if [[ "$new_expires_in" -lt "$min_valid_seconds" ]]; then
+            log "Silent refresh for '$session_name' returned short-lived token (${new_expires_in}s), requires browser login"
+            return 1
+        fi
+
+        # Calculate new expiration timestamp
+        local new_expires_epoch new_expires_at
+        new_expires_epoch=$(epoch_plus_seconds "$new_expires_in")
+        new_expires_at=$(epoch_to_iso "$new_expires_epoch")
+
+        # Use existing refresh token if new one wasn't provided
+        if [[ -z "$new_refresh_token" ]]; then
+            new_refresh_token="$refresh_token"
+        fi
+
+        # Update the cache file with new tokens
+        local tmp_file="${cache_file}.tmp.$$"
+        if jq --arg access "$new_access_token" \
+              --arg expires "$new_expires_at" \
+              --arg refresh "$new_refresh_token" \
+              '.accessToken = $access | .expiresAt = $expires | .refreshToken = $refresh' \
+              "$cache_file" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$cache_file"; then
+            return 0
+        else
+            rm -f "$tmp_file"
+            log "Silent refresh failed for '$session_name': could not update cache file"
+            return 1
+        fi
+    else
+        # Log the error for debugging (but don't expose sensitive details)
+        if echo "$response" | grep -qi "expired\|invalid"; then
+            log "Silent refresh failed for '$session_name': refresh token expired or invalid"
+        else
+            log "Silent refresh failed for '$session_name': API call failed"
+        fi
+        return 1
+    fi
+}
+
 # Check and refresh a single session
 # Args: cache_file session_name [force]
 check_and_refresh_session() {
@@ -209,28 +364,37 @@ check_and_refresh_session() {
     seconds_until_expiry=$((expires_epoch - current_epoch))
     minutes_until_expiry=$((seconds_until_expiry / 60))
 
+    # Helper to perform refresh (silent first, then browser fallback)
+    do_refresh() {
+        # Try silent refresh first (no browser)
+        if silent_refresh_session "$cache_file" "$session_name"; then
+            log "Successfully refreshed session '$session_name' (silent)"
+            return 0
+        fi
+
+        # Fall back to browser-based login
+        log "Falling back to browser login for '$session_name'..."
+        if aws sso login --sso-session "$session_name" 2>&1 | tee -a "$LOG_FILE"; then
+            log "Successfully refreshed session '$session_name' (browser)"
+            record_browser_login "$session_name"  # Track for session expiry estimates
+            return 0
+        else
+            log "ERROR: Failed to refresh session '$session_name'"
+            return 1
+        fi
+    }
+
     # Check if we need to refresh
     if [[ "$force" == "true" ]]; then
         log "Session '$session_name' force refresh requested (${minutes_until_expiry}m remaining). Refreshing..."
-        # Perform the refresh
-        if aws sso login --sso-session "$session_name" 2>&1 | tee -a "$LOG_FILE"; then
-            log "Successfully refreshed session '$session_name'"
-        else
-            log "ERROR: Failed to refresh session '$session_name'"
-        fi
+        do_refresh
     elif [[ $minutes_until_expiry -le $REFRESH_THRESHOLD_MINUTES ]]; then
         if [[ $minutes_until_expiry -le 0 ]]; then
             log "Session '$session_name' has EXPIRED. Refreshing..."
         else
             log "Session '$session_name' expires in ${minutes_until_expiry}m (threshold: ${REFRESH_THRESHOLD_MINUTES}m). Refreshing..."
         fi
-
-        # Perform the refresh
-        if aws sso login --sso-session "$session_name" 2>&1 | tee -a "$LOG_FILE"; then
-            log "Successfully refreshed session '$session_name'"
-        else
-            log "ERROR: Failed to refresh session '$session_name'"
-        fi
+        do_refresh
     else
         log "Session '$session_name' OK - expires in ${minutes_until_expiry}m"
     fi
@@ -318,17 +482,29 @@ cmd_status() {
         [[ -v seen_sessions["$session_name"] ]] && continue
         seen_sessions["$session_name"]=1
 
-        local minutes
+        local minutes session_minutes session_info_str
         if minutes=$(get_session_info "$session_name"); then
             local time_str
             time_str=$(format_time "$minutes")
 
+            # Get session expiry estimate (when browser re-auth will be needed)
+            session_info_str=""
+            if session_minutes=$(get_session_expiry_minutes "$session_name"); then
+                if [[ $session_minutes -gt 0 ]]; then
+                    local session_time_str
+                    session_time_str=$(format_time "$session_minutes")
+                    session_info_str="  ${BLUE}(browser re-auth in ${session_time_str})${NC}"
+                else
+                    session_info_str="  ${YELLOW}(browser re-auth soon)${NC}"
+                fi
+            fi
+
             if [[ $minutes -le 0 ]]; then
-                echo -e "  ${RED}✗${NC} $session_name  ${RED}$time_str${NC}"
+                echo -e "  ${RED}✗${NC} $session_name  ${RED}$time_str${NC}${session_info_str}"
             elif [[ $minutes -le $REFRESH_THRESHOLD_MINUTES ]]; then
-                echo -e "  ${YELLOW}!${NC} $session_name  ${YELLOW}$time_str remaining${NC} (will refresh soon)"
+                echo -e "  ${YELLOW}!${NC} $session_name  ${YELLOW}$time_str remaining${NC} (will refresh soon)${session_info_str}"
             else
-                echo -e "  ${GREEN}✓${NC} $session_name  ${GREEN}$time_str remaining${NC}"
+                echo -e "  ${GREEN}✓${NC} $session_name  ${GREEN}$time_str remaining${NC}${session_info_str}"
             fi
         else
             echo -e "  ${RED}✗${NC} $session_name  ${RED}no active session${NC}"
@@ -508,9 +684,13 @@ cmd_help() {
     echo "    Set AWS_SSO_REFRESH_INTERVAL to change how often to check"
     echo "    (default: 10 minutes, min: 1, max: 60)"
     echo ""
+    echo "    Set AWS_SSO_SESSION_DURATION to match your Identity Center session"
+    echo "    duration for accurate browser re-auth estimates (default: 8 hours)"
+    echo ""
     echo "    Examples:"
-    echo "      export AWS_SSO_REFRESH_THRESHOLD=5   # Refresh 5m before expiry"
-    echo "      export AWS_SSO_REFRESH_INTERVAL=5    # Check every 5 minutes"
+    echo "      export AWS_SSO_REFRESH_THRESHOLD=5    # Refresh 5m before expiry"
+    echo "      export AWS_SSO_REFRESH_INTERVAL=5     # Check every 5 minutes"
+    echo "      export AWS_SSO_SESSION_DURATION=12    # 12-hour IdC session"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "    aws-sso-refresh              # Show session status"
