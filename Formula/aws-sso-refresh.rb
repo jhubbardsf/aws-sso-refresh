@@ -1,8 +1,8 @@
 class AwsSsoRefresh < Formula
   desc "Automatically refresh AWS SSO sessions before they expire"
   homepage "https://github.com/jhubbardsf/aws-sso-refresh"
-  url "https://github.com/jhubbardsf/aws-sso-refresh/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "0a22f7854c7f3a15ebfb0287958a750039c76582bdf8a0c35f1759df3d128c43"
+  url "https://github.com/jhubbardsf/aws-sso-refresh/archive/refs/tags/v1.0.2.tar.gz"
+  sha256 "c466322dddb64390713e268f710404b506179dcb4fd394cbd433b9145d704e89"
   license "MIT"
   head "https://github.com/jhubbardsf/aws-sso-refresh.git", branch: "main"
 
