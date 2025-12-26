@@ -17,7 +17,7 @@
 set -eo pipefail
 
 # Version
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # Configuration
 REFRESH_THRESHOLD_MINUTES="${AWS_SSO_REFRESH_THRESHOLD:-30}"
@@ -109,11 +109,11 @@ iso_to_epoch() {
 
     # Try GNU date first, then BSD date
     if date --version &>/dev/null; then
-        # GNU date
-        date -d "$clean_time" "+%s" 2>/dev/null || echo "0"
+        # GNU date - append UTC timezone
+        date -d "${clean_time}Z" "+%s" 2>/dev/null || echo "0"
     else
-        # BSD date (macOS)
-        date -j -f "%Y-%m-%dT%H:%M:%S" "$clean_time" "+%s" 2>/dev/null || echo "0"
+        # BSD date (macOS) - set TZ=UTC to interpret as UTC time
+        TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$clean_time" "+%s" 2>/dev/null || echo "0"
     fi
 }
 
