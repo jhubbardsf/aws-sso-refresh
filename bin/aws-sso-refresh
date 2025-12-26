@@ -6,21 +6,24 @@
 # so you never hit "token expired" errors.
 #
 # Usage:
-#   aws-sso-refresh           Run refresh check (default)
-#   aws-sso-refresh status    Show all sessions with expiry times
-#   aws-sso-refresh install   Install and start the background daemon
-#   aws-sso-refresh uninstall Remove the background daemon
-#   aws-sso-refresh logs      Tail the refresh log
-#   aws-sso-refresh help      Show this help message
+#   aws-sso-refresh              Show session status (default)
+#   aws-sso-refresh status       Show all sessions with expiry times
+#   aws-sso-refresh refresh      Check and refresh expiring sessions
+#   aws-sso-refresh refresh -f   Force refresh all sessions now
+#   aws-sso-refresh install      Install and start the background daemon
+#   aws-sso-refresh uninstall    Remove the background daemon
+#   aws-sso-refresh logs         Tail the refresh log
+#   aws-sso-refresh help         Show this help message
 #
 
 set -eo pipefail
 
 # Version
-VERSION="1.0.2"
+VERSION="1.0.3"
 
 # Configuration
 REFRESH_THRESHOLD_MINUTES="${AWS_SSO_REFRESH_THRESHOLD:-30}"
+REFRESH_INTERVAL_MINUTES="${AWS_SSO_REFRESH_INTERVAL:-10}"
 SSO_CACHE_DIR="$HOME/.aws/sso/cache"
 AWS_CONFIG="$HOME/.aws/config"
 LOG_DIR="$HOME/.local/share/aws-sso-refresh"
@@ -51,6 +54,17 @@ if ((BASH_VERSINFO[0] < 4)); then
     echo "Your version: $BASH_VERSION"
     echo ""
     echo "On macOS, install modern bash with: brew install bash"
+    exit 1
+fi
+
+# Validate configuration
+if [[ $REFRESH_INTERVAL_MINUTES -lt 1 || $REFRESH_INTERVAL_MINUTES -gt 60 ]]; then
+    echo "Error: AWS_SSO_REFRESH_INTERVAL must be between 1 and 60 minutes (got: $REFRESH_INTERVAL_MINUTES)"
+    exit 1
+fi
+
+if [[ $REFRESH_THRESHOLD_MINUTES -lt 1 ]]; then
+    echo "Error: AWS_SSO_REFRESH_THRESHOLD must be at least 1 minute (got: $REFRESH_THRESHOLD_MINUTES)"
     exit 1
 fi
 
@@ -175,9 +189,11 @@ get_session_info() {
 }
 
 # Check and refresh a single session
+# Args: cache_file session_name [force]
 check_and_refresh_session() {
     local cache_file="$1"
     local session_name="$2"
+    local force="${3:-false}"
 
     # Parse the cache file
     local expires_at
@@ -194,7 +210,15 @@ check_and_refresh_session() {
     minutes_until_expiry=$((seconds_until_expiry / 60))
 
     # Check if we need to refresh
-    if [[ $minutes_until_expiry -le $REFRESH_THRESHOLD_MINUTES ]]; then
+    if [[ "$force" == "true" ]]; then
+        log "Session '$session_name' force refresh requested (${minutes_until_expiry}m remaining). Refreshing..."
+        # Perform the refresh
+        if aws sso login --sso-session "$session_name" 2>&1 | tee -a "$LOG_FILE"; then
+            log "Successfully refreshed session '$session_name'"
+        else
+            log "ERROR: Failed to refresh session '$session_name'"
+        fi
+    elif [[ $minutes_until_expiry -le $REFRESH_THRESHOLD_MINUTES ]]; then
         if [[ $minutes_until_expiry -le 0 ]]; then
             log "Session '$session_name' has EXPIRED. Refreshing..."
         else
@@ -217,7 +241,26 @@ check_and_refresh_session() {
 # ============================================================================
 
 cmd_refresh() {
-    log "=== AWS SSO Refresh Check Starting ==="
+    local force="false"
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force)
+                force="true"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "$force" == "true" ]]; then
+        log "=== AWS SSO Force Refresh Starting ==="
+    else
+        log "=== AWS SSO Refresh Check Starting ==="
+    fi
 
     # Build the URL -> session name mapping
     build_session_map
@@ -249,7 +292,7 @@ cmd_refresh() {
             continue
         fi
 
-        check_and_refresh_session "$cache_file" "$session_name"
+        check_and_refresh_session "$cache_file" "$session_name" "$force"
 
         # Mark session as checked
         checked_sessions["$session_name"]=1
@@ -305,7 +348,15 @@ cmd_status() {
         else
             echo -e "${BOLD}Daemon:${NC} ${GREEN}loaded${NC} (waiting for next interval)"
         fi
-        echo -e "${BOLD}Interval:${NC} every 10 minutes"
+        # Read interval from plist if it exists, otherwise use current config
+        local interval_seconds interval_minutes
+        if [[ -f "$PLIST_PATH" ]]; then
+            interval_seconds=$(defaults read "$PLIST_PATH" StartInterval 2>/dev/null || echo "600")
+            interval_minutes=$((interval_seconds / 60))
+            echo -e "${BOLD}Interval:${NC} every ${interval_minutes}m"
+        else
+            echo -e "${BOLD}Interval:${NC} every ${REFRESH_INTERVAL_MINUTES}m"
+        fi
         echo -e "${BOLD}Threshold:${NC} refresh when < ${REFRESH_THRESHOLD_MINUTES}m remaining"
     else
         echo -e "${BOLD}Daemon:${NC} ${YELLOW}not installed${NC}"
@@ -334,6 +385,9 @@ cmd_install() {
         exit 1
     fi
 
+    # Calculate interval in seconds
+    local interval_seconds=$((REFRESH_INTERVAL_MINUTES * 60))
+
     # Create plist
     cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -347,10 +401,11 @@ cmd_install() {
     <array>
         <string>${bash_path}</string>
         <string>${script_path}</string>
+        <string>refresh</string>
     </array>
 
     <key>StartInterval</key>
-    <integer>600</integer>
+    <integer>${interval_seconds}</integer>
 
     <key>RunAtLoad</key>
     <true/>
@@ -359,6 +414,10 @@ cmd_install() {
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>AWS_SSO_REFRESH_THRESHOLD</key>
+        <string>${REFRESH_THRESHOLD_MINUTES}</string>
+        <key>AWS_SSO_REFRESH_INTERVAL</key>
+        <string>${REFRESH_INTERVAL_MINUTES}</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -379,7 +438,7 @@ EOF
     echo -e "${GREEN}Daemon installed successfully!${NC}"
     echo ""
     echo "The daemon will:"
-    echo "  • Run every 10 minutes"
+    echo "  • Run every ${REFRESH_INTERVAL_MINUTES} minutes"
     echo "  • Refresh sessions expiring within ${REFRESH_THRESHOLD_MINUTES} minutes"
     echo "  • Log to $LOG_FILE"
     echo ""
@@ -427,26 +486,36 @@ cmd_help() {
     echo "Automatically refresh AWS SSO sessions before they expire."
     echo ""
     echo -e "${BOLD}USAGE:${NC}"
-    echo "    aws-sso-refresh [COMMAND]"
+    echo "    aws-sso-refresh [COMMAND] [OPTIONS]"
     echo ""
     echo -e "${BOLD}COMMANDS:${NC}"
-    echo "    (none)      Run refresh check now"
+    echo "    (none)      Show session status (default)"
     echo "    status      Show all sessions with expiry times"
+    echo "    refresh     Check and refresh expiring sessions"
     echo "    install     Install and start the background daemon"
     echo "    uninstall   Remove the background daemon"
     echo "    logs        Follow the refresh log"
     echo "    help        Show this help message"
     echo "    version     Show version"
     echo ""
+    echo -e "${BOLD}OPTIONS:${NC}"
+    echo "    -f, --force   Force refresh all sessions (use with 'refresh')"
+    echo ""
     echo -e "${BOLD}CONFIGURATION:${NC}"
     echo "    Set AWS_SSO_REFRESH_THRESHOLD to change the refresh threshold"
     echo "    (default: 30 minutes before expiry)"
     echo ""
-    echo "    Example: export AWS_SSO_REFRESH_THRESHOLD=60"
+    echo "    Set AWS_SSO_REFRESH_INTERVAL to change how often to check"
+    echo "    (default: 10 minutes, min: 1, max: 60)"
+    echo ""
+    echo "    Examples:"
+    echo "      export AWS_SSO_REFRESH_THRESHOLD=5   # Refresh 5m before expiry"
+    echo "      export AWS_SSO_REFRESH_INTERVAL=5    # Check every 5 minutes"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
-    echo "    aws-sso-refresh              # Check and refresh expiring sessions"
-    echo "    aws-sso-refresh status       # See all session statuses"
+    echo "    aws-sso-refresh              # Show session status"
+    echo "    aws-sso-refresh refresh      # Check and refresh expiring sessions"
+    echo "    aws-sso-refresh refresh -f   # Force refresh all sessions now"
     echo "    aws-sso-refresh install      # Enable automatic background refresh"
     echo "    aws-sso-refresh logs         # Watch the refresh log"
     echo ""
@@ -467,11 +536,15 @@ cmd_version() {
 # ============================================================================
 
 main() {
-    local command="${1:-refresh}"
+    local command="${1:-status}"
 
     case "$command" in
-        status)
+        status|"")
             cmd_status
+            ;;
+        refresh)
+            shift
+            cmd_refresh "$@"
             ;;
         install)
             cmd_install
@@ -487,9 +560,6 @@ main() {
             ;;
         version|--version|-v)
             cmd_version
-            ;;
-        refresh|"")
-            cmd_refresh
             ;;
         *)
             echo -e "${RED}Unknown command: $command${NC}"

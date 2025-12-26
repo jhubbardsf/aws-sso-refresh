@@ -40,7 +40,7 @@ aws-sso-refresh status
 # Run a refresh check manually
 aws-sso-refresh
 
-# Install the background daemon (runs every 10 minutes)
+# Install the background daemon (default: checks every 10 minutes)
 aws-sso-refresh install
 
 # View the refresh log
@@ -83,7 +83,17 @@ By default, sessions are refreshed when they have less than 30 minutes remaining
 export AWS_SSO_REFRESH_THRESHOLD=60  # Refresh when < 60 minutes remaining
 ```
 
-Add this to your `~/.zshrc` or `~/.bashrc` to persist.
+### Check Interval
+
+By default, the daemon checks sessions every 10 minutes. Customize this with:
+
+```bash
+export AWS_SSO_REFRESH_INTERVAL=5  # Check every 5 minutes (min: 1, max: 60)
+```
+
+**Note:** After changing these values, run `aws-sso-refresh uninstall` and `aws-sso-refresh install` to update the daemon configuration.
+
+Add these exports to your `~/.zshrc` or `~/.bashrc` to persist them.
 
 ### AWS Config
 
